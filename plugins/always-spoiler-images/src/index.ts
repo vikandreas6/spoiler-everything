@@ -3,13 +3,14 @@ import { FluxDispatcher, React, ReactNative, url } from "@vendetta/metro/common"
 import { after, before, instead } from "@vendetta/patcher";
 import { findInReactTree } from "@vendetta/utils";
 
-const BUILD = "1.0";
+const BUILD = "1.0.1";
 const IS_SPOILER = 1 << 3;
 const IS_COMPONENTS_V2 = 1 << 15;
 const LOCAL_UPDATE = Symbol("spoiler-everything.local-update");
 const CONTROL_BASE = `https://spoiler.invalid/${Math.random().toString(36).slice(2)}/`;
 const originals = new Map<string, any>();
 const revealed = new Set<string>();
+const mediaControls = new Set<string>();
 const stickerKeys = ["sticker_items", "stickerItems", "stickers", "sticker_ids", "stickerIds"];
 let patches: (() => void)[] = [];
 let active = false;
@@ -26,6 +27,32 @@ function copyWith(value: any, updates: Record<string, any>) {
         descriptors[key] = { value: replacement, enumerable: true, configurable: true, writable: true };
     }
     return Object.create(Object.getPrototypeOf(value), descriptors);
+}
+
+// Reply previews copy message text but cannot use its local reveal links.
+// Strip only controls belonging to this plugin session, preserving records
+// and user-authored links. Clean saved payloads too so unload cannot restore them.
+function cleanReplyControls(message: any, inReply = false, depth = 0): any {
+    if (!message || typeof message !== "object" || depth > 5) return message;
+    const updates: Record<string, any> = {};
+    if (inReply && typeof message.content === "string" && message.content.includes(CONTROL_BASE)) {
+        const content = message.content.replace(/\n?\[Show media\]\((https:\/\/spoiler\.invalid\/[^)\r\n]+)\)/g,
+            (match: string, href: string) => href.startsWith(CONTROL_BASE) ? "" : match);
+        if (content !== message.content) updates.content = content;
+    }
+    for (const key of ["referenced_message", "referencedMessage"]) {
+        const reference = cleanReplyControls(message[key], true, depth + 1);
+        if (reference !== message[key]) updates[key] = reference;
+    }
+    for (const key of ["message_snapshots", "messageSnapshots"]) {
+        if (!Array.isArray(message[key])) continue;
+        const snapshots = message[key].map((snapshot: any) => {
+            const nested = cleanReplyControls(snapshot?.message, inReply, depth + 1);
+            return nested !== snapshot?.message ? copyWith(snapshot, { message: nested }) : snapshot;
+        });
+        if (snapshots.some((snapshot: any, i: number) => snapshot !== message[key][i])) updates[key] = snapshots;
+    }
+    return Object.keys(updates).length ? copyWith(message, updates) : message;
 }
 
 function messageKey(message: any) {
@@ -61,10 +88,11 @@ function spoilerImage(attachment: any, incoming: boolean) {
 
 // Images keep native spoilers; videos, embeds and stickers use Show media.
 // Audio, voice messages, documents, emojis and bot components stay visible.
-function prepare(message: any, incoming: boolean, hide: boolean, depth = 0): { message: any; count: number } {
-    if (!message || typeof message !== "object" || depth > 5) return { message, count: 0 };
+function prepare(message: any, incoming: boolean, hide: boolean, depth = 0): { message: any; count: number; controlCount: number } {
+    if (!message || typeof message !== "object" || depth > 5) return { message, count: 0, controlCount: 0 };
     const updates: Record<string, any> = {};
     let count = 0;
+    let replyCount = 0;
     // V2 components can reference attached files. Preserve their complete
     // payload, including attachments and flags, so the bot UI stays intact.
     const componentMessage = Array.isArray(message.components) && message.components.length > 0
@@ -90,9 +118,10 @@ function prepare(message: any, incoming: boolean, hide: boolean, depth = 0): { m
     }
     for (const key of ["referenced_message", "referencedMessage"]) {
         if (message[key]) {
-            const result = prepare(message[key], incoming, hide, depth + 1);
+            const result = prepare(message[key], incoming, true, depth + 1);
             updates[key] = result.message;
             count += result.count;
+            replyCount += result.count;
         }
     }
     for (const key of ["message_snapshots", "messageSnapshots"]) {
@@ -101,11 +130,12 @@ function prepare(message: any, incoming: boolean, hide: boolean, depth = 0): { m
                 if (!snapshot?.message) return snapshot;
                 const result = prepare(snapshot.message, incoming, hide, depth + 1);
                 count += result.count;
+                replyCount += result.count - result.controlCount;
                 return copyWith(snapshot, { message: result.message });
             });
         }
     }
-    return { message: Object.keys(updates).length ? copyWith(message, updates) : message, count };
+    return { message: Object.keys(updates).length ? copyWith(message, updates) : message, count, controlCount: count - replyCount };
 }
 
 function transform(message: any, incoming: boolean, partial = false) {
@@ -117,14 +147,18 @@ function transform(message: any, incoming: boolean, partial = false) {
     // MessageRecord, including its methods and normalized nested records.
     // A stored placeholder is already concealed; never replace it with the
     // raw original saved for the local MESSAGE_UPDATE reveal action.
-    const source = partial && saved ? copyWith(saved, message)
-        : incoming && isPlaceholder && saved ? saved : message;
+    const source = cleanReplyControls(partial && saved ? copyWith(saved, message)
+        : incoming && isPlaceholder && saved ? saved : message);
     const show = Boolean(key && revealed.has(key));
     const result = prepare(source, incoming, !show);
+    if (key && !show && (incoming || !isPlaceholder)) {
+        if (result.controlCount) mediaControls.add(key);
+        else mediaControls.delete(key);
+    }
     if (!key || (!result.count && !saved)) return result.message;
     // Rendering a revealed record must not overwrite a saved raw payload.
     if (!isPlaceholder && (incoming || !saved)) originals.set(key, source);
-    if (show || !result.count) return result.message;
+    if (show || !result.controlCount) return result.message;
     hiddenMedia += result.count;
     const text = result.message.content ?? "";
     const control = `[Show media](${CONTROL_BASE}${key})`;
@@ -145,7 +179,7 @@ function localUpdate(message: any) {
 
 function toggleMedia(key: string, show: boolean) {
     const original = originals.get(key);
-    if (!original) return;
+    if (!original || !mediaControls.has(key)) return;
     if (show) revealed.add(key);
     else revealed.delete(key);
     localUpdate(show ? prepare(original, false, false).message : transform(original, false));
@@ -199,7 +233,7 @@ function patchMessageMenu() {
     if (!sheets || !Row) return;
     patches.push(before("openLazy", sheets, ([component, name, props]) => {
         const key = messageKey(props?.message);
-        if (name !== "MessageLongPressActionSheet" || !key || !originals.has(key)) return;
+        if (name !== "MessageLongPressActionSheet" || !key || !mediaControls.has(key)) return;
         component.then((instance: any) => {
             if (!active) return;
             const unpatch = after("default", instance, (_, tree) => {
@@ -240,7 +274,7 @@ export default {
                 if (!action || action[LOCAL_UPDATE]) return;
                 if (action.type === "MESSAGE_DELETE") {
                     const key = messageKey({ id: action.id ?? action.messageId, channel_id: action.channelId ?? action.channel_id });
-                    if (key) { originals.delete(key); revealed.delete(key); }
+                    if (key) { originals.delete(key); revealed.delete(key); mediaControls.delete(key); }
                     return;
                 }
                 if (!(action.type === "MESSAGE_CREATE" || action.type === "MESSAGE_UPDATE"
@@ -282,6 +316,7 @@ export default {
         for (const message of originals.values()) localUpdate(message);
         originals.clear();
         revealed.clear();
+        mediaControls.clear();
         rendererHooks = 0;
         linkHooks = 0;
     },
