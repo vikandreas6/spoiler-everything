@@ -1,0 +1,14 @@
+{
+  "name": "Always Spoiler Media",
+  "description": "Conceals images, videos, GIF/link previews, and stickers. Audio, voice messages, emojis, documents, and bot components stay visible.",
+  "authors": [
+    {
+      "name": "Local custom plugin",
+      "id": "0"
+    }
+  ],
+  "main": "src/index.ts",
+  "vendetta": {
+    "icon": "ic_image"
+  }
+}

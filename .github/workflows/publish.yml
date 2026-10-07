@@ -1,0 +1,107 @@
+name: Build and publish plugin
+run-name: ${{ inputs.reset_history && 'Version 1.0' || github.event.head_commit.message || 'Build and publish plugin' }}
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      reset_history:
+        description: Replace development history with the current version 1.0 and remove old workflow runs
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: plugin-publish
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: pnpm install
+      - run: pnpm run build
+      - name: Publish dist to gh-pages
+        if: ${{ !inputs.reset_history }}
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./dist
+      - name: Prepare version 1.0 archive
+        if: ${{ inputs.reset_history }}
+        run: |
+          python3 - <<'PY'
+          import pathlib, subprocess, zipfile
+          archive = "always-spoiler-images-revenge-classic.zip"
+          tracked = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")
+          files = [pathlib.Path(p) for p in tracked if p and p != archive]
+          files.extend(p for p in pathlib.Path("dist").rglob("*") if p.is_file())
+          with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+              for file in sorted(set(files)):
+                  bundle.write(file, file.as_posix())
+          PY
+      - name: Replace development branches with version 1.0
+        if: ${{ inputs.reset_history }}
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          test -z "$(git ls-remote --tags origin refs/tags/v1.0)"
+          pages_sha=$(git ls-remote --heads origin refs/heads/gh-pages | cut -f1)
+          test -n "$pages_sha"
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add always-spoiler-images-revenge-classic.zip
+          main_commit=$(git commit-tree "$(git write-tree)" -m 'Version 1.0')
+          touch dist/.nojekyll
+          pages_index="$RUNNER_TEMP/version-one-pages-index"
+          GIT_INDEX_FILE="$pages_index" git read-tree --empty
+          GIT_INDEX_FILE="$pages_index" git --work-tree="$PWD/dist" add --all
+          pages_tree=$(GIT_INDEX_FILE="$pages_index" git write-tree)
+          pages_commit=$(git commit-tree "$pages_tree" -m 'Version 1.0')
+          git push --atomic \
+            --force-with-lease="refs/heads/main:$GITHUB_SHA" \
+            --force-with-lease="refs/heads/gh-pages:$pages_sha" \
+            origin "$main_commit:refs/heads/main" "$pages_commit:refs/heads/gh-pages" "$main_commit:refs/tags/v1.0"
+      - name: Publish version 1.0 release
+        if: ${{ inputs.reset_history }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > "$RUNNER_TEMP/version-one-notes.md" <<'NOTES'
+          Always Spoiler Media 1.0 for Revenge Classic.
+
+          Images use native spoiler overlays. Tap Show media to reveal videos, GIF/link previews, and stickers. Audio, voice messages, emojis, documents, and bot components stay visible.
+
+          Install URL:
+          ```text
+          https://raw.githubusercontent.com/vikandreas6/spoiler-everything/gh-pages/always-spoiler-images/
+          ```
+          NOTES
+          gh release create v1.0 always-spoiler-images-revenge-classic.zip \
+            --repo "$GITHUB_REPOSITORY" --title 'Version 1.0' \
+            --notes-file "$RUNNER_TEMP/version-one-notes.md"
+  clean_workflow_history:
+    needs: build
+    if: ${{ inputs.reset_history }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Remove completed development runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs?per_page=100&status=completed" \
+            --jq ".workflow_runs[] | select(.id < $GITHUB_RUN_ID) | .id" > "$RUNNER_TEMP/development-run-ids"
+          while IFS= read -r run_id; do
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/runs/$run_id"
+          done < "$RUNNER_TEMP/development-run-ids"
